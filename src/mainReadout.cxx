@@ -55,6 +55,14 @@
 #endif
 
 
+// option to enable compilation with Control-OCCPlugin support
+#define WITH_OCC
+//#undef WITH_OCC
+#ifdef WITH_OCC
+#include <OccInstance.h>
+#include <RuntimeControlledObject.h>
+#endif
+
 // namespace used
 using namespace AliceO2::InfoLogger;
 using namespace AliceO2::Common;
@@ -76,12 +84,49 @@ static void signalHandler(int signalId) {
   ShutdownRequest=1;
 }
 
-// the main program loop
-int main(int argc, char* argv[])
-{
+
+
+
+class Readout {
+  public:
   ConfigFile cfg;
   const char* cfgFileURI="";
   const char* cfgFileEntryPoint=""; // where in the config tree to look for
+ 
+  int init(int argc, char* argv[]);  
+  int configure();
+  int reset(); // as opposed to configure()
+  int start();
+  int stop(); // as opposed to start()
+  int iterateRunning();
+  int iterateCheck();
+
+    
+  private:
+  
+  // configuration parameters
+  double cfgExitTimeout;
+  double cfgFlushEquipmentTimeout;
+  int cfgDisableAggregatorSlicing;
+  
+  // runtime entities
+  std::vector<std::unique_ptr<Consumer>> dataConsumers;
+  std::vector<std::unique_ptr<ReadoutEquipment>> readoutDevices;
+  std::unique_ptr<DataBlockAggregator> agg;
+  std::unique_ptr<AliceO2::Common::Fifo<DataSetReference>> agg_output;
+  
+  int isRunning=0; // set to 1 when running
+  AliceO2::Common::Timer t;  // time counter from start()
+  
+  int latencyFd=-1; // file descriptor to /dev/cpu_dma_latency
+  
+  bool isError=0; // flag set to 1 when error has been detected
+  std::vector<std::string> strErrors; // errors backlog
+  std::mutex mutexErrors; // mutex to guard access to error variables  
+};
+
+
+int Readout::init(int argc, char* argv[]) {
   if (argc<2) {
     printf("Please provide path to configuration file\n");
     return -1;
@@ -90,7 +135,7 @@ int main(int argc, char* argv[])
   if (argc>2) {
     cfgFileEntryPoint=argv[2];
   }
-
+  
   // configure signal handlers for clean exit
   struct sigaction signalSettings;
   bzero(&signalSettings,sizeof(signalSettings));
@@ -114,6 +159,17 @@ int main(int argc, char* argv[])
   #else
     theLog.log("NUMA : no");
   #endif
+  #ifdef WITH_OCC
+    theLog.log("OCC : yes");
+  #else
+    theLog.log("OCC : no");
+  #endif
+  
+  return 0;
+}
+
+
+int Readout::configure() {
   // load configuration file
   theLog.log("Reading configuration from %s %s",cfgFileURI,cfgFileEntryPoint);
   try {
@@ -142,12 +198,11 @@ int main(int argc, char* argv[])
     theLog.log("Error : %s",err.c_str());
     return -1;
   }
-
-
+  
   // try to prevent deep sleeps  
   theLog.log("Disabling CPU deep sleep for process");
   int maxLatency=2;
-  int latencyFd = open("/dev/cpu_dma_latency", O_WRONLY);
+  latencyFd = open("/dev/cpu_dma_latency", O_WRONLY);
   if (latencyFd < 0) {
     theLog.log("Error opening /dev/cpu_dma_latency");
   } else {
@@ -155,17 +210,16 @@ int main(int argc, char* argv[])
       theLog.log("Error writing to /dev/cpu_dma_latency");
     }
   }
-  
 
   // extract optional configuration parameters
   // configuration parameter: | readout | exitTimeout | double | -1 | Time in seconds after which the program exits automatically. -1 for unlimited. |
-  double cfgExitTimeout=-1;
+  cfgExitTimeout=-1;
   cfg.getOptionalValue<double>("readout.exitTimeout",cfgExitTimeout);
   // configuration parameter: | readout | flushEquipmentTimeout | double | 0 | Time in seconds to wait for data once the equipments are stopped. 0 means stop immediately. |
-  double cfgFlushEquipmentTimeout=0;
+  cfgFlushEquipmentTimeout=0;
   cfg.getOptionalValue<double>("readout.flushEquipmentTimeout",cfgFlushEquipmentTimeout);
   // configuration parameter: | readout | disableAggregatorSlicing | int | 0 | When set, the aggregator slicing is disabled, data pages are passed through without grouping/slicing. |
-  int cfgDisableAggregatorSlicing=0;
+  cfgDisableAggregatorSlicing=0;
   cfg.getOptionalValue<int>("readout.disableAggregatorSlicing",cfgDisableAggregatorSlicing);
   
   
@@ -256,7 +310,6 @@ int main(int argc, char* argv[])
   
   
   // configuration of data consumers
-  std::vector<std::unique_ptr<Consumer>> dataConsumers;
   for (auto kName : ConfigFileBrowser (&cfg,"consumer-")) {
 
     // skip disabled
@@ -323,7 +376,6 @@ int main(int argc, char* argv[])
 
   // configure readout equipments
   int nEquipmentFailures=0; // number of failed equipment instanciation
-  std::vector<std::unique_ptr<ReadoutEquipment>> readoutDevices;
   for (auto kName : ConfigFileBrowser (&cfg,"equipment-")) {
 
     // example iteration on each sub-key
@@ -384,9 +436,10 @@ int main(int argc, char* argv[])
 
   // aggregator
   theLog.log("Creating aggregator");
-  AliceO2::Common::Fifo<DataSetReference> agg_output(1000);
+
   int nEquipmentsAggregated=0;
-  auto agg=std::make_unique<DataBlockAggregator>(&agg_output,"Aggregator");
+  agg_output=std::make_unique<AliceO2::Common::Fifo<DataSetReference>>(1000);
+  agg=std::make_unique<DataBlockAggregator>(agg_output.get(),"Aggregator");
     
   for (auto && readoutDevice : readoutDevices) {
       //theLog.log("Adding equipment: %s",readoutDevice->getName().c_str());
@@ -395,6 +448,12 @@ int main(int argc, char* argv[])
   }
   theLog.log("Aggregator: %d equipments", nEquipmentsAggregated);
 
+  
+  return 0;
+}
+
+
+int Readout::start() {
   theLog.log("Starting aggregator");
   if (cfgDisableAggregatorSlicing) {
     theLog.log("Aggregator slicing disabled");
@@ -404,7 +463,7 @@ int main(int argc, char* argv[])
 
   // notify consumers of imminent data flow start
   for (auto& c : dataConsumers) {
-    c->starting();
+    c->start();
   }
 
   theLog.log("Starting readout equipments");
@@ -418,12 +477,11 @@ int main(int argc, char* argv[])
   theLog.log("Running");
 
   // reset exit timeout, if any
-  AliceO2::Common::Timer t;
   if (cfgExitTimeout>0) {
     t.reset(cfgExitTimeout*1000000);
     theLog.log("Automatic exit in %.2f seconds",cfgExitTimeout);
   }
-  int isRunning=1;
+  isRunning=1;
 
   theLog.log("Entering loop");
   #ifdef CALLGRIND
@@ -431,52 +489,63 @@ int main(int argc, char* argv[])
     CALLGRIND_START_INSTRUMENTATION;
   #endif
 
-  while (1) {
-    if (isRunning) {
-      if (((cfgExitTimeout>0)&&(t.isTimeout()))||(ShutdownRequest)) {
-        isRunning=0;
-        theLog.log("Stopping data readout");
-	for (auto && readoutDevice : readoutDevices) {
-      	  
-	  if (cfgFlushEquipmentTimeout<=0) {
-	    theLog.log("Stopping immediately readout equipments, last pages might be lost");
-	    // stop readout loop before stopping data (and loose the last pages)
-            // otherwise we get incomplete pages of unkown size (driver bug), impossible to parse
-	    readoutDevice->stop();
-	  }
-          readoutDevice->setDataOff();
-	  // todo: should flush aggregator content after a while
-        }
-	
-        t.reset(cfgFlushEquipmentTimeout*1000000);  // add a delay before stopping aggregator - continune to empty FIFOs
+  return 0;
+}
 
-        // notify consumers of imminent data flow stop
-        for (auto& c : dataConsumers) {
-          c->stopping();
-        }
+int Readout::iterateCheck() {
+  if (isError) {
+    return -1;
+  }
+  return 0;
+}
 
+int Readout::iterateRunning() {
+
+  if (isRunning) {
+    if (((cfgExitTimeout>0)&&(t.isTimeout()))||(ShutdownRequest)) {
+      isRunning=0;
+      theLog.log("Stopping data readout");
+      for (auto && readoutDevice : readoutDevices) {
+
+	if (cfgFlushEquipmentTimeout<=0) {
+	  theLog.log("Stopping immediately readout equipments, last pages might be lost");
+	  // stop readout loop before stopping data (and loose the last pages)
+          // otherwise we get incomplete pages of unkown size (driver bug), impossible to parse
+	  readoutDevice->stop();
+	}
+        readoutDevice->setDataOff();
+	// todo: should flush aggregator content after a while
       }
-    } else {
-      if (t.isTimeout()) {
-        break;
-      }
+
+      t.reset(cfgFlushEquipmentTimeout*1000000);  // add a delay before stopping aggregator - continune to empty FIFOs
+
+
     }
-
-    DataSetReference bc=nullptr;
-    agg_output.pop(bc);
-
-
-    if (bc!=nullptr) {
-      for (auto& c : dataConsumers) {
-        c->pushData(bc);
-      }
-
-    } else {
-      usleep(1000);
+  } else {
+    if (t.isTimeout()) {
+      return 1; // should stop running
     }
-
   }
 
+  DataSetReference bc=nullptr;
+  agg_output->pop(bc);
+
+
+  if (bc!=nullptr) {
+    for (auto& c : dataConsumers) {
+      c->pushData(bc);
+    }
+
+  } else {
+    usleep(1000);
+  }
+  
+  return 0;
+}
+
+
+
+int Readout::stop() {
   #ifdef CALLGRIND
     CALLGRIND_STOP_INSTRUMENTATION;
     CALLGRIND_DUMP_STATS;
@@ -492,11 +561,24 @@ int main(int argc, char* argv[])
   agg->stop();
 
   theLog.log("Stopping consumers");
-  // close consumers before closing readout equipments (owner of data blocks)
+  for (auto& c : dataConsumers) {
+    c->stop();
+  }
+   
+  // ensure output buffers empty ?
+  return 0;
+}
+
+
+
+int Readout::reset() {
+
+  // destroy consumers before closing readout equipments (owner of data blocks)
   dataConsumers.clear();
 
-  agg_output.clear();
+  agg_output->clear();
   agg=nullptr;  // destroy aggregator, and release blocks it may still own.
+  agg_output=nullptr;
    
   // todo: check nothing in the input pipeline
   // flush & stop equipments
@@ -516,9 +598,135 @@ int main(int argc, char* argv[])
 
   if (latencyFd>=0) {
     close(latencyFd);
+    latencyFd=-1;
   }
 
   theLog.log("Operations completed");
+  
+  return 0;
+}
+
+
+#ifdef WITH_OCC
+class ReadoutOCCStateMachine : public RuntimeControlledObject
+{
+public:
+  ReadoutOCCStateMachine(Readout *r) : RuntimeControlledObject("Readout Process") {
+    theReadout=r;
+  }
+
+  int executeConfigure(const PropertyMap& properties){
+    return theReadout->configure();
+  }
+  
+  int executeReset() {
+    return theReadout->reset();
+  }
+  
+  int executeRecover() {
+    return -1;
+  }
+  
+  int executeStart() {
+    return theReadout->start();
+  }
+  
+  int executeStop() {
+    return theReadout->stop();
+  }
+  
+  int executePause() {
+    return -1;
+  }
+  
+  int executeResume() {
+    return -1;
+  }
+
+  int executeExit() {
+    return -1;
+  }
+
+  int iterateRunning() {
+    return theReadout->iterateRunning();
+  }
+  
+  int iterateCheck() {
+    return theReadout->iterateCheck();
+  }
+  
+private:
+  Readout *theReadout=nullptr;  
+};
+#endif
+
+
+// the main program loop
+int main(int argc, char* argv[])
+{
+  Readout theReadout;
+  
+  int err=0;
+
+  err=theReadout.init(argc,argv);
+  if (err) {
+    return err;
+  }
+
+#ifdef WITH_OCC
+
+  // start OCC - control
+  ReadoutOCCStateMachine csm(&theReadout);
+  OccInstance occ(&csm);
+
+  for (;;) {
+    sleep(1);
+    if (ShutdownRequest) {
+      break;
+    }
+  }
+  occ.wait();
+
+
+
+#else
+  
+  err=theReadout.configure();
+  if (err) {
+    return err;
+  }
+
+  for (int i=0;i<3;i++) {
+  
+  err=theReadout.start();
+  if (err) {
+    return err;
+  }
+  while (1) {
+    err=theReadout.iterateRunning();
+    if (err) break;
+    err=theReadout.iterateCheck();
+    if (err) break;
+  }
+  err=theReadout.stop();
+  if (err) {
+    return err;
+  }
+  
+  }
+  
+#endif
+ 
+  return 0;
+}
+/*
+
+
+
+  // stop OCC - control
+  stopOcc();
+
 
   return 0;
 }
+*/

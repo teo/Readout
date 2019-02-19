@@ -10,6 +10,7 @@ CMAKE_MINIMUM_REQUIRED(VERSION 3.5.2 FATAL_ERROR)
 FOREACH (p
         CMP0025 # CMake 3.0
         CMP0042 # CMake 3.0
+        CMP0074 # package_ROOT dirs for find_package()
         )
     IF (POLICY ${p})
         cmake_policy(SET ${p} NEW)
@@ -76,6 +77,7 @@ include_directories(
         ${ReadoutCard_INCLUDE_DIRS}
         ${DataSampling_INCLUDE_DIRS}
         ${Numa_INCLUDE_DIRS}
+        ${Occ_INCLUDE_DIR}
 )
 
 add_library(

@@ -7,6 +7,7 @@ find_package(InfoLogger REQUIRED)
 find_package(ReadoutCard REQUIRED)
 find_package(ZeroMQ REQUIRED)
 find_package(Numa)
+find_package(Occ)
 
 find_package(FairRoot)
 if (FAIRROOT_FOUND)
@@ -56,6 +57,13 @@ endif (Numa_FOUND)
 
 ADD_DEFINITIONS(-DWITH_DATASAMPLING)
 
+if (Occ_FOUND)  
+  ADD_DEFINITIONS(-DWITH_OCC)  
+else (Occ_FOUND)
+  message(WARNING "Occ not found, correpsonding features will be disabled.")
+endif(Occ_FOUND)
+
+
 o2_define_bucket(
         NAME
         o2_readout_bucket
@@ -73,6 +81,8 @@ o2_define_bucket(
         ${ReadoutCard_LIBRARIES}
         ${DataSampling_LIBRARIES}
         ${Numa_LIBRARIES}
+        $<$<BOOL:${Occ_FOUND}>:AliceO2::Occ>
+	
 
         SYSTEMINCLUDE_DIRECTORIES
         ${Boost_INCLUDE_DIRS}

@@ -61,8 +61,23 @@ class ConsumerStats: public Consumer {
 
   struct rusage previousUsage; // variable to keep track of last getrusage() result
   struct rusage currentUsage; // variable to keep track of last getrusage() result  
-  double timePreviousGetrusage=0; // variable storing 'runningTime' value when getrusage was previously called (0 if not called yet)
-  double cpuUsedOverLastInterval=0; // average CPU usage over latest measurement interval
+  double timePreviousGetrusage; // variable storing 'runningTime' value when getrusage was previously called (0 if not called yet)
+  double cpuUsedOverLastInterval; // average CPU usage over latest measurement interval
+  
+
+  // reset all counters and timers for a fresh start
+  // must be called once before first publishStats() call
+  void reset() {   
+    counterBlocks=0;
+    counterBytesTotal=0;
+    counterBytesHeader=0;
+    counterBytesDiff=0;
+    elapsedTime=0.0;  
+    timePreviousGetrusage=0;
+    cpuUsedOverLastInterval=0;
+    monitoringUpdateTimer.reset(monitoringUpdatePeriod*1000000);
+    runningTime.reset();
+  }
   
   
   void sendMetricNoException(Metric&& metric, DerivedMetricMode mode = DerivedMetricMode::NONE){
@@ -110,6 +125,7 @@ class ConsumerStats: public Consumer {
 
 
   public:
+  
   ConsumerStats(ConfigFile &cfg, std::string cfgEntryPoint):Consumer(cfg,cfgEntryPoint) {
 
     // configuration parameter: | consumer-stats-* | monitoringEnabled | int | 0 | Enable (1) or disable (0) readout monitoring. |
@@ -130,34 +146,15 @@ class ConsumerStats: public Consumer {
       if (processMonitoringInterval>0) {
         monitoringCollector->enableProcessMonitoring(processMonitoringInterval);
       }
-
-      monitoringUpdateTimer.reset(monitoringUpdatePeriod*1000000);
     }
-
-    counterBytesTotal=0;
-    counterBytesHeader=0;
-    counterBlocks=0;
-    counterBytesDiff=0;
-    runningTime.reset();
-    elapsedTime=0.0;
-
+    
+    // make sure to initialize all counters and timers
+    reset();
   }
+  
   ~ConsumerStats() {
-    if (elapsedTime==0) {
-      theLog.log("Stopping stats clock");
-      elapsedTime=runningTime.getTime();
-    }
-    if (counterBytesTotal>0) {
-      theLog.log("Stats: %llu blocks, %.2f MB, %.2f%% header overhead",(unsigned long long)counterBlocks,counterBytesTotal/(1024*1024.0),counterBytesHeader*100.0/counterBytesTotal);
-      theLog.log("Stats: average block size = %llu bytes",(unsigned long long)counterBytesTotal/counterBlocks);
-      theLog.log("Stats: average block rate = %s",NumberOfBytesToString((counterBlocks)/elapsedTime,"Hz",1000).c_str());
-      theLog.log("Stats: average throughput = %s",NumberOfBytesToString(counterBytesTotal/elapsedTime,"B/s").c_str());
-      theLog.log("Stats: elapsed time = %.5lfs",elapsedTime);
-      publishStats();
-    } else {
-      theLog.log("Stats: no data received");
-    }
   }
+  
   int pushData(DataBlockContainerReference &b) {
     
     counterBlocks++;
@@ -177,17 +174,30 @@ class ConsumerStats: public Consumer {
     return 0;
   }
   
-  int starting() {
+  int start() {
     theLog.log("Starting stats clock");
-    runningTime.reset();
+    reset();
+    publishStats(); // publish a first "zero" value
     return 0;
   };
 
-  int stopping() {
+  int stop() {
     theLog.log("Stopping stats clock");
     elapsedTime=runningTime.getTime();
+
+    if (counterBytesTotal>0) {
+      theLog.log("Stats: %llu blocks, %.2f MB, %.2f%% header overhead",(unsigned long long)counterBlocks,counterBytesTotal/(1024*1024.0),counterBytesHeader*100.0/counterBytesTotal);
+      theLog.log("Stats: average block size = %llu bytes",(unsigned long long)counterBytesTotal/counterBlocks);
+      theLog.log("Stats: average block rate = %s",NumberOfBytesToString((counterBlocks)/elapsedTime,"Hz",1000).c_str());
+      theLog.log("Stats: average throughput = %s",NumberOfBytesToString(counterBytesTotal/elapsedTime,"B/s").c_str());
+      theLog.log("Stats: elapsed time = %.5lfs",elapsedTime);
+    } else {
+      theLog.log("Stats: no data received");
+    }
+    
+    publishStats();
     return 0;
-  };
+  }
 
 };
 
